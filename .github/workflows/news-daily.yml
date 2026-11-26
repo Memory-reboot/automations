@@ -1,51 +1,37 @@
-# Name of the GitHub Actions workflow shown in the "Actions" tab
 name: Daily News Poster
 
-# Controls when this workflow runs
 on:
-  # Trigger 1: Run automatically once every day on a schedule.
-  # GitHub Actions ALWAYS uses UTC (Coordinated Universal Time).
-  # IST (India Standard Time) is UTC + 5 hours 30 minutes.
-  # 02:30 UTC + 5:30 = 08:00 AM IST.
-  # Cron format: 'minute hour day-of-month month day-of-week'
-  # To change the time, subtract 5h 30m from your desired IST time and update 'minute hour'.
   schedule:
-    - cron: '30 2 * * *'
-
-  # Trigger 2: Adds a "Run workflow" button in the GitHub Actions UI
-  # so you can run this manually anytime for testing.
+    - cron: '30 2 * * *' # 8:00 AM IST
   workflow_dispatch:
 
-# Jobs that will run when the workflow is triggered
 jobs:
-  # Job ID shown in the GitHub Actions run summary
   post:
-    # Use a free Ubuntu Linux virtual machine provided by GitHub
     runs-on: ubuntu-latest
-
     steps:
-      # Step 1: Download a copy of this repository's files into the runner
       - name: Check out repository
         uses: actions/checkout@v4
 
-      # Step 2: Install Python 3.10 on the virtual machine
       - name: Set up Python 3.10
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
-      # Step 3: Install any Python libraries listed in requirements.txt
-      # (Currently empty in Stage 1; packages will be added in later stages)
+      # Notice the path points to your folder
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: pip install -r news-instagram/requirements.txt
 
-      # Step 4: Execute our main Python script
+      # We add working-directory so python runs inside the folder
       - name: Run AI Poster
+        working-directory: ./news-instagram
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
         run: python main.py
 
-      # Step 5: Save the generated news card image as a downloadable workflow artifact
+      # We tell it to grab the image from inside the folder
       - name: Upload Generated Image
         uses: actions/upload-artifact@v4
         with:
           name: daily-news-card
-          path: post.jpg
+          path: news-instagram/post.jpg
