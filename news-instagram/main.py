@@ -9,6 +9,7 @@ the single most important headline for an Indian audience using a 3-tier fallbac
 """
 
 from datetime import datetime, timezone
+import io
 import json
 import os
 import re
@@ -20,6 +21,7 @@ import feedparser
 from google import genai
 from google.genai import types
 from groq import Groq
+from PIL import Image, ImageDraw, ImageFont
 import requests
 
 RSS_FEEDS = [
@@ -336,7 +338,66 @@ def main() -> None:
     log(f"Title  : {top_story['title']}")
     log(f"Source : {top_story.get('source', 'N/A')}")
     log(f"Link   : {top_story.get('link', 'N/A')}")
+    create_news_card(top_story)
     log("Success!")
+
+
+def create_news_card(story):
+    print("--- GENERATING IMAGE ---")
+    prompt = "Abstract dark blue gradient background with subtle geometric shapes, soft light in the corner, clean minimal, no text, no people"
+    url = f"https://image.pollinations.ai/prompt/{requests.utils.quote(prompt)}?width=1080&height=1350&nologo=true"
+    
+    print("Downloading background...")
+    try:
+        response = requests.get(url, timeout=20)
+        response.raise_for_status()
+        bg_image = Image.open(io.BytesIO(response.content)).convert("RGB")
+    except Exception as e:
+        print(f"Failed to download background: {e}")
+        bg_image = Image.new("RGB", (1080, 1350), color=(15, 25, 45))
+
+    draw = ImageDraw.Draw(bg_image)
+    
+    try:
+        font_headline = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 70)
+        font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 40)
+    except IOError:
+        font_headline = ImageFont.load_default()
+        font_small = ImageFont.load_default()
+
+    overlay = Image.new("RGBA", bg_image.size, (0, 0, 0, 150))
+    bg_image = Image.alpha_composite(bg_image.convert("RGBA"), overlay).convert("RGB")
+    draw = ImageDraw.Draw(bg_image)
+
+    margin = 80
+    draw.text((margin, margin), "DAILY NEWS", font=font_small, fill=(255, 100, 100))
+    
+    headline = story['title']
+    words = headline.split()
+    lines = []
+    current_line = ""
+    
+    for word in words:
+        test_line = current_line + word + " "
+        if draw.textlength(test_line, font=font_headline) < (1080 - (margin * 2)):
+            current_line = test_line
+        else:
+            lines.append(current_line.strip())
+            current_line = word + " "
+    lines.append(current_line.strip())
+
+    y_text = 400
+    for line in lines:
+        draw.text((margin, y_text), line, font=font_headline, fill=(255, 255, 255))
+        y_text += 90
+
+    date_str = datetime.utcnow().strftime("%d %B %Y")
+    draw.text((margin, 1200), f"Source: {story['source']}", font=font_small, fill=(200, 200, 200))
+    draw.text((margin, 1250), date_str, font=font_small, fill=(200, 200, 200))
+
+    output_path = "post.jpg"
+    bg_image.save(output_path, "JPEG", quality=95)
+    print(f"✅ Saved image as {output_path}")
 
 
 if __name__ == "__main__":
