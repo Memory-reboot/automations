@@ -1,7 +1,8 @@
 import feedparser
 import os
 import json
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 from datetime import datetime
 
 FEEDS = [
@@ -20,9 +21,8 @@ def fetch_news():
     # 1. Fetch and Deduplicate
     for url in FEEDS:
         feed = feedparser.parse(url)
-        for entry in feed.entries[:5]: # Get top 5 from each
+        for entry in feed.entries[:5]: # Get top 5 from each feed
             title = entry.title
-            # Simple deduplication: skip if we've seen a very similar title
             if title not in seen_titles:
                 seen_titles.add(title)
                 all_articles.append({
@@ -33,17 +33,15 @@ def fetch_news():
                 
     print(f"Fetched {len(all_articles)} unique headlines.")
     
-    # 2. Set up Gemini
+    # 2. Set up Gemini using the NEW google-genai SDK
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
-        print("❌ ERROR: GEMINI_API_KEY is missing. Skipping ranking.")
+        print("❌ ERROR: GEMINI_API_KEY is missing.")
         return
 
-    genai.configure(api_key=api_key)
-    # Use the fast and free 1.5 Flash model
-    model = genai.GenerativeModel('gemini-1.5-flash')
+    # Initialize the new client
+    client = genai.Client(api_key=api_key)
     
-    # Prepare the prompt
     headlines_text = "\n".join([f"- {a['title']}" for a in all_articles])
     prompt = f"""
     You are the chief editor of a major Indian news channel.
@@ -59,24 +57,21 @@ def fetch_news():
     print("Asking Gemini to rank the news...")
     
     try:
-        # Ask Gemini and force it to return JSON
-        response = model.generate_content(
-            prompt,
-            generation_config={"response_mime_type": "application/json"}
+        # Use the new SDK method and a supported model (gemini-2.0-flash)
+        response = client.models.generate_content(
+            model='gemini-2.0-flash',
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+            )
         )
         
-        # Parse the JSON response
         rankings = json.loads(response.text)
-        
-        # Sort by highest score
         rankings.sort(key=lambda x: x['score'], reverse=True)
         
         print("\n--- 🏆 TODAY'S TOP STORY ---")
-        top_story_title = rankings[0]['title']
-        print(f"Headline: {top_story_title}")
+        print(f"Headline: {rankings[0]['title']}")
         print(f"Importance Score: {rankings[0]['score']}/10")
-        
-        # In the next stage, we will use this top_story_title to generate the image
         print("\n(Stage 3 will generate the image for this headline next!)")
         
     except Exception as e:
