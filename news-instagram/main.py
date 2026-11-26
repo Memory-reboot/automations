@@ -2,8 +2,7 @@ import feedparser
 import os
 import json
 import time
-from google import genai
-from google.genai import types
+import requests
 from datetime import datetime
 
 FEEDS = [
@@ -15,7 +14,7 @@ FEEDS = [
 ]
 
 def fetch_news():
-    print("--- STAGE 2b: DEDUPLICATION & RANKING ---")
+    print("--- STAGE 2b: DEDUPLICATION & RANKING (GROQ) ---")
     all_articles = []
     seen_titles = set()
     
@@ -34,42 +33,70 @@ def fetch_news():
                 
     print(f"Fetched {len(all_articles)} unique headlines.")
     
-    # 2. Set up Gemini
-    api_key = os.environ.get("GEMINI_API_KEY")
+    # 2. Set up Groq
+    api_key = os.environ.get("GROQ_API_KEY")
     if not api_key:
-        print("❌ ERROR: GEMINI_API_KEY is missing.")
+        print("❌ ERROR: GROQ_API_KEY is missing.")
         return
 
-    client = genai.Client(api_key=api_key)
-    
     headlines_text = "\n".join([f"- {a['title']}" for a in all_articles])
-    prompt = f"""
-    You are the chief editor of a major Indian news channel.
-    Read the following list of today's headlines:
     
-    {headlines_text}
+    # Groq Prompt (system prompt ensures JSON)
+    messages = [
+        {
+            "role": "system",
+            "content": "You are the chief editor of a major Indian news channel. Rank the provided headlines from 1 to 10 based on importance for a general Indian audience. Return ONLY a valid JSON array of objects with the keys 'title' and 'score'. Do not include any other text or markdown formatting."
+        },
+        {
+            "role": "user",
+            "content": f"Here are today's headlines:\n{headlines_text}"
+        }
+    ]
+
+    print("Asking Groq to rank the news...")
     
-    Rank them from 1 to 10 based on how important and impactful they are for a general Indian audience.
-    Return ONLY a valid JSON array of objects with the keys "title" and "score". 
-    Do not include any other text or markdown formatting.
-    """
-    
-    print("Asking Gemini to rank the news...")
-    
-    # 3. Retry Logic for 503 Errors
+    # 3. Retry Logic for Groq
     max_retries = 3
     for attempt in range(max_retries):
         try:
-            response = client.models.generate_content(
-                model='gemini-3.8-flash',
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                )
+            # Call Groq's API (OpenAI compatible)
+            response = requests.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": "llama-3.3-70b-versatile", # A very smart and fast free model
+                    "messages": messages,
+                    "temperature": 0.2,
+                    "response_format": {"type": "json_object"}
+                },
+                timeout=30
             )
             
-            # If successful, parse and print
-            rankings = json.loads(response.text)
+            response.raise_for_status() # Check for HTTP errors
+            data = response.json()
+            
+            # Extract the text response from the JSON structure
+            response_text = data['choices'][0]['message']['content']
+            
+            # Parse the JSON string returned by Groq
+            # (Sometimes models wrap JSON in markdown block, so we clean it)
+            if response_text.startswith("```json"):
+                response_text = response_text.replace("```json\n", "").replace("```", "").strip()
+                
+            rankings = json.loads(response_text)
+            
+            # Handle cases where the model returns a dict instead of a list
+            if isinstance(rankings, dict):
+                # If it returns {"rankings": [...]}, extract the list
+                if "rankings" in rankings:
+                    rankings = rankings["rankings"]
+                else:
+                    # If it returns a single object, put it in a list
+                    rankings = [rankings]
+
             rankings.sort(key=lambda x: x['score'], reverse=True)
             
             print("\n--- 🏆 TODAY'S TOP STORY ---")
@@ -80,12 +107,12 @@ def fetch_news():
             break # Exit the loop since it worked!
             
         except Exception as e:
-            if "503" in str(e) and attempt < max_retries - 1:
-                print(f"⚠️ Google is busy (503). Retrying in 5 seconds... (Attempt {attempt + 1}/{max_retries})")
+            print(f"❌ Groq Error: {e}")
+            if attempt < max_retries - 1:
+                print(f"⚠️ Retrying in 5 seconds... (Attempt {attempt + 1}/{max_retries})")
                 time.sleep(5)
             else:
-                print(f"❌ Gemini Error: {e}")
-                break
+                print("❌ Max retries reached. Giving up.")
 
 if __name__ == "__main__":
     fetch_news()
