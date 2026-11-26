@@ -1,18 +1,20 @@
 """
-Daily AI News Poster — Stage 2b: RSS Fetching, Deduplication & Multi-Tier AI Ranking
+Daily AI News Poster — Stage 2b (Hardened & Timeout-Safe)
 
 Fetches daily headlines from free RSS feeds, removes duplicate titles, and selects
 the single most important headline for an Indian audience using a 3-tier fallback:
-  1. Primary: Google Gemini (google-genai SDK, gemini-3.8-flash)
-  2. Fallback 1: Groq (groq SDK, llama-3.3-70b-versatile)
-  3. Fallback 2: First deduplicated headline (deterministic safe default)
+  1. Primary: Google Gemini (google-genai SDK, gemini-3.8-flash, 10s timeout)
+  2. Fallback 1: Groq (groq SDK, llama-3.3-70b-versatile, 10s timeout)
+  3. Fallback 2: all_articles[0] (deterministic safe default)
 """
 
 from datetime import datetime, timezone
 import json
 import os
 import re
-from typing import Any
+import sys
+import threading
+from typing import Any, Callable, TypeVar
 
 import feedparser
 from google import genai
@@ -30,30 +32,67 @@ RSS_FEEDS = [
 
 GEMINI_MODEL = "gemini-3.8-flash"
 GROQ_MODEL = "llama-3.3-70b-versatile"
-REQUEST_TIMEOUT_SECONDS = 15
+NETWORK_TIMEOUT = 10
 MAX_ARTICLES_PER_FEED = 10
 USER_AGENT = "DailyAINewsPoster/1.0 (+https://github.com/)"
 
+T = TypeVar("T")
+
+
+def log(message: str) -> None:
+    """Print immediately with flush=True so GitHub Actions logs stream in real time."""
+    print(message, flush=True)
+
+
+def run_with_timeout(func: Callable[[], T], timeout_seconds: int, label: str) -> T:
+    """Execute a blocking call in a daemon thread so hangs never stall the process."""
+    result_box: dict[str, Any] = {}
+    error_box: dict[str, BaseException] = {}
+
+    def target() -> None:
+        try:
+            result_box["value"] = func()
+        except BaseException as exc:
+            error_box["error"] = exc
+
+    worker = threading.Thread(target=target, daemon=True)
+    worker.start()
+    worker.join(timeout=timeout_seconds)
+
+    if worker.is_alive():
+        raise TimeoutError(f"{label} exceeded strict {timeout_seconds}s wall-clock timeout.")
+    if "error" in error_box:
+        raise error_box["error"]
+    return result_box["value"]
+
 
 def fetch_rss_articles(feed_urls: list[str]) -> list[dict[str, str]]:
-    """Fetch entries from each RSS feed without failing the whole run if one feed errors."""
-    print("Fetching feeds...")
+    """Fetch entries from each RSS feed with a strict 10-second timeout per request."""
+    log("Fetching feeds...")
     articles: list[dict[str, str]] = []
     headers = {"User-Agent": USER_AGENT}
 
     for url in feed_urls:
         try:
-            response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT_SECONDS)
+            log(f"[RSS] Requesting {url} (timeout={NETWORK_TIMEOUT}s)...")
+            response = run_with_timeout(
+                lambda u=url: requests.get(u, headers=headers, timeout=NETWORK_TIMEOUT),
+                NETWORK_TIMEOUT,
+                f"RSS {url}",
+            )
+            log(f"[RSS] Response received from {url} (status={response.status_code}).")
             response.raise_for_status()
-            parsed_feed = feedparser.parse(response.content)
 
-            if getattr(parsed_feed, "bozo", False) and not parsed_feed.entries:
-                print(f"  Warning: Could not parse feed {url}: {parsed_feed.bozo_exception}")
+            parsed_feed = feedparser.parse(response.content)
+            entries = getattr(parsed_feed, "entries", [])
+            if getattr(parsed_feed, "bozo", False) and not entries:
+                log(f"[RSS] Warning: Parse error for {url}: {getattr(parsed_feed, 'bozo_exception', 'unknown')}")
                 continue
 
-            feed_title = parsed_feed.feed.get("title", url)
+            feed_meta = getattr(parsed_feed, "feed", {}) or {}
+            feed_title = feed_meta.get("title", url) if isinstance(feed_meta, dict) else url
             count = 0
-            for entry in parsed_feed.entries[:MAX_ARTICLES_PER_FEED]:
+            for entry in entries[:MAX_ARTICLES_PER_FEED]:
                 title = (entry.get("title") or "").strip()
                 link = (entry.get("link") or "").strip()
                 if not title:
@@ -62,22 +101,20 @@ def fetch_rss_articles(feed_urls: list[str]) -> list[dict[str, str]]:
                     {
                         "title": title,
                         "link": link,
-                        "source": feed_title,
+                        "source": str(feed_title),
                     }
                 )
                 count += 1
-            print(f"  Fetched {count} headlines from {feed_title}")
-        except requests.RequestException as exc:
-            print(f"  Warning: Network error fetching {url}: {exc}")
+            log(f"[RSS] Collected {count} headlines from {feed_title}.")
         except Exception as exc:
-            print(f"  Warning: Unexpected error processing {url}: {exc}")
+            log(f"[RSS] Failed fetching {url}: {exc}")
 
     return articles
 
 
 def deduplicate_articles(articles: list[dict[str, str]]) -> list[dict[str, str]]:
     """Remove articles with duplicate exact title strings while preserving order."""
-    print("Deduplicating headlines...")
+    log("Deduplicating headlines...")
     seen_titles: set[str] = set()
     unique_articles: list[dict[str, str]] = []
 
@@ -87,7 +124,7 @@ def deduplicate_articles(articles: list[dict[str, str]]) -> list[dict[str, str]]
             seen_titles.add(title)
             unique_articles.append(article)
 
-    print(f"  Kept {len(unique_articles)} unique headlines (from {len(articles)} total).")
+    log(f"Kept {len(unique_articles)} unique headlines (from {len(articles)} total).")
     return unique_articles
 
 
@@ -104,8 +141,8 @@ def build_ranking_prompt(articles: list[dict[str, str]]) -> str:
         "and return the ranked list sorted from highest score to lowest score.\n\n"
         "STRICT OUTPUT RULES:\n"
         "- Return ONLY a valid JSON array of objects.\n"
-        "- Each object must have exactly two keys: \"title\" (string, copied verbatim) "
-        "and \"score\" (integer 1-10).\n"
+        '- Each object must have exactly two keys: "title" (string, copied verbatim) '
+        'and "score" (integer 1-10).\n'
         "- Do NOT include markdown code fences, commentary, or any text outside the JSON array.\n\n"
         "Example format:\n"
         '[{"title": "Example headline", "score": 9}]\n\n'
@@ -114,17 +151,15 @@ def build_ranking_prompt(articles: list[dict[str, str]]) -> str:
 
 
 def parse_ranked_json(raw_text: str) -> list[dict[str, Any]]:
-    """Parse and validate a JSON array of {'title': str, 'score': int/float} objects."""
+    """Parse and validate a JSON array of {'title': str, 'score': number} objects."""
     if not raw_text or not raw_text.strip():
         raise ValueError("Empty response received from AI model.")
 
     cleaned = raw_text.strip()
-    # Strip optional markdown code fences if a model adds them despite instructions
     fence_match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", cleaned, re.IGNORECASE)
     if fence_match:
         cleaned = fence_match.group(1).strip()
 
-    # Extract the JSON array slice if extra leading/trailing text slipped in
     start_idx = cleaned.find("[")
     end_idx = cleaned.rfind("]")
     if start_idx == -1 or end_idx == -1 or end_idx < start_idx:
@@ -155,116 +190,153 @@ def parse_ranked_json(raw_text: str) -> list[dict[str, Any]]:
 
 
 def rank_with_gemini(prompt: str) -> list[dict[str, Any]]:
-    """Primary AI tier: rank headlines using Google Gemini via google-genai SDK."""
+    """Primary AI tier: rank headlines via Google Gemini with a strict 10-second timeout."""
     api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY / GOOGLE_API_KEY environment variable is not set.")
 
-    client = genai.Client(api_key=api_key)
-    response = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            temperature=0.2,
-        ),
+    # google-genai HttpOptions.timeout is in milliseconds (10_000 ms = 10 s)
+    http_options_kwargs: dict[str, Any] = {"timeout": NETWORK_TIMEOUT * 1000}
+    if hasattr(types, "HttpRetryOptions"):
+        http_options_kwargs["retry_options"] = types.HttpRetryOptions(attempts=1)
+
+    client = genai.Client(
+        api_key=api_key,
+        http_options=types.HttpOptions(**http_options_kwargs),
     )
-    return parse_ranked_json(response.text or "")
+
+    def _call_gemini() -> str:
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                temperature=0.2,
+            ),
+        )
+        return response.text or ""
+
+    log(f"[AI - Gemini] Calling {GEMINI_MODEL} (timeout={NETWORK_TIMEOUT}s)...")
+    try:
+        raw_text = run_with_timeout(_call_gemini, NETWORK_TIMEOUT, "Gemini API")
+        log("[AI - Gemini] Response received from Gemini API.")
+    except Exception as exc:
+        log(f"[AI - Gemini] Call failed: {exc}")
+        raise
+
+    return parse_ranked_json(raw_text)
 
 
 def rank_with_groq(prompt: str) -> list[dict[str, Any]]:
-    """Fallback 1 tier: rank headlines using Groq API with llama-3.3-70b-versatile."""
+    """Fallback 1 tier: rank headlines via Groq with a strict 10-second timeout."""
     api_key = os.environ.get("GROQ_API_KEY")
     if not api_key:
         raise RuntimeError("GROQ_API_KEY environment variable is not set.")
 
-    client = Groq(api_key=api_key)
-    completion = client.chat.completions.create(
-        model=GROQ_MODEL,
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "You are a JSON-only news ranking assistant. "
-                    "Output strictly a valid JSON array with no extra prose."
-                ),
-            },
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0.2,
-        max_tokens=4096,
-    )
-    content = completion.choices[0].message.content or ""
-    return parse_ranked_json(content)
+    client = Groq(api_key=api_key, timeout=NETWORK_TIMEOUT, max_retries=0)
+
+    def _call_groq() -> str:
+        completion = client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a JSON-only news ranking assistant. "
+                        "Output strictly a valid JSON array with no extra prose."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.2,
+            max_tokens=4096,
+            timeout=NETWORK_TIMEOUT,
+        )
+        return completion.choices[0].message.content or ""
+
+    log(f"[AI - Groq] Calling {GROQ_MODEL} (timeout={NETWORK_TIMEOUT}s)...")
+    try:
+        raw_text = run_with_timeout(_call_groq, NETWORK_TIMEOUT, "Groq API")
+        log("[AI - Groq] Response received from Groq API.")
+    except Exception as exc:
+        log(f"[AI - Groq] Call failed: {exc}")
+        raise
+
+    return parse_ranked_json(raw_text)
 
 
 def match_article_by_title(
-    selected_title: str, articles: list[dict[str, str]]
+    selected_title: str, all_articles: list[dict[str, str]]
 ) -> dict[str, str]:
-    """Match an AI-selected title back to the original article metadata when possible."""
-    for article in articles:
+    """Match an AI-selected title back to original article metadata when possible."""
+    for article in all_articles:
         if article["title"] == selected_title:
             return article
 
     normalized = selected_title.casefold().strip()
-    for article in articles:
+    for article in all_articles:
         if article["title"].casefold().strip() == normalized:
             return article
 
     return {"title": selected_title, "link": "", "source": "AI Selected"}
 
 
-def select_top_headline(articles: list[dict[str, str]]) -> tuple[dict[str, str], str]:
+def select_top_headline(all_articles: list[dict[str, str]]) -> tuple[dict[str, str], str]:
     """Select the single most important headline using the 3-tier AI fallback chain."""
-    prompt = build_ranking_prompt(articles)
+    prompt = build_ranking_prompt(all_articles)
 
     # Primary: Google Gemini
-    print(f"Ranking headlines with Primary AI ({GEMINI_MODEL})...")
     try:
         ranked = rank_with_gemini(prompt)
         top_title = ranked[0]["title"]
-        print(f"Success! Primary AI selected headline (score={ranked[0]['score']}).")
-        return match_article_by_title(top_title, articles), f"Gemini ({GEMINI_MODEL})"
+        log(f"Success! Primary AI selected headline (score={ranked[0]['score']}).")
+        return match_article_by_title(top_title, all_articles), f"Gemini ({GEMINI_MODEL})"
     except Exception as exc:
-        print(f"Primary AI failed ({exc}), trying Fallback 1...")
+        log(f"Primary AI failed ({exc}), trying Fallback 1...")
 
     # Fallback 1: Groq
-    print(f"Ranking headlines with Fallback 1 ({GROQ_MODEL})...")
     try:
         ranked = rank_with_groq(prompt)
         top_title = ranked[0]["title"]
-        print(f"Success! Fallback 1 selected headline (score={ranked[0]['score']}).")
-        return match_article_by_title(top_title, articles), f"Groq ({GROQ_MODEL})"
+        log(f"Success! Fallback 1 selected headline (score={ranked[0]['score']}).")
+        return match_article_by_title(top_title, all_articles), f"Groq ({GROQ_MODEL})"
     except Exception as exc:
-        print(f"Fallback 1 failed ({exc}), trying Fallback 2...")
+        log(f"Fallback 1 failed ({exc}).")
 
     # Fallback 2: Deterministic safe default
-    print("Using Fallback 2: Selecting first deduplicated headline as default.")
-    return articles[0], "Fallback 2 (First Deduplicated Headline)"
+    log("AI Failed. Falling back to default")
+    return all_articles[0], "Default Fallback (all_articles[0])"
 
 
 def main() -> None:
-    """Run the Stage 2b pipeline: fetch RSS feeds, deduplicate, and select top headline."""
-    print(f"Starting Daily News Bot (Stage 2b) at {datetime.now(timezone.utc).isoformat()}")
+    """Run the Stage 2b pipeline and always reach the final top-story output."""
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except Exception:
+        pass
+
+    log(f"Starting Daily News Bot (Stage 2b) at {datetime.now(timezone.utc).isoformat()}")
 
     raw_articles = fetch_rss_articles(RSS_FEEDS)
-    if not raw_articles:
-        print("Error: No articles could be fetched from any RSS feed. Exiting safely.")
-        return
+    all_articles = deduplicate_articles(raw_articles)
 
-    unique_articles = deduplicate_articles(raw_articles)
-    if not unique_articles:
-        print("Error: No valid headlines remained after deduplication. Exiting safely.")
-        return
+    if not all_articles:
+        log("Warning: All RSS feeds failed or returned 0 articles. Using safe fallback.")
+        top_story = {
+            "title": "No news headlines available today.",
+            "link": "",
+            "source": "RSS Fallback",
+        }
+        method_used = "RSS Empty Fallback"
+    else:
+        top_story, method_used = select_top_headline(all_articles)
 
-    top_article, method_used = select_top_headline(unique_articles)
-
-    print("\n--- SELECTED TOP HEADLINE ---")
-    print(f"Method : {method_used}")
-    print(f"Title  : {top_article['title']}")
-    print(f"Source : {top_article.get('source', 'N/A')}")
-    print(f"Link   : {top_article.get('link', 'N/A')}")
-    print("Success!")
+    log("\nTODAY'S TOP STORY...")
+    log(f"Method : {method_used}")
+    log(f"Title  : {top_story['title']}")
+    log(f"Source : {top_story.get('source', 'N/A')}")
+    log(f"Link   : {top_story.get('link', 'N/A')}")
+    log("Success!")
 
 
 if __name__ == "__main__":
