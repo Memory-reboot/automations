@@ -1,1 +1,1 @@
-# Dependencies will be added in Stage 2 (feedparser, requests, etc.)
+feedparser
