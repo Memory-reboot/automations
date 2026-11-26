@@ -21,4 +21,6 @@ jobs:
 
       - name: Run news poster
         working-directory: ./news-instagram
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: python main.py
