@@ -1,2 +1,4 @@
 feedparser
 google-genai
+groq
+requests
