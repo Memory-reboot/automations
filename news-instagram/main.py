@@ -1,6 +1,7 @@
 import feedparser
 import os
 import json
+import time
 from google import genai
 from google.genai import types
 from datetime import datetime
@@ -21,7 +22,7 @@ def fetch_news():
     # 1. Fetch and Deduplicate
     for url in FEEDS:
         feed = feedparser.parse(url)
-        for entry in feed.entries[:5]: # Get top 5 from each feed
+        for entry in feed.entries[:5]: 
             title = entry.title
             if title not in seen_titles:
                 seen_titles.add(title)
@@ -33,13 +34,12 @@ def fetch_news():
                 
     print(f"Fetched {len(all_articles)} unique headlines.")
     
-    # 2. Set up Gemini using the NEW google-genai SDK
+    # 2. Set up Gemini
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         print("❌ ERROR: GEMINI_API_KEY is missing.")
         return
 
-    # Initialize the new client
     client = genai.Client(api_key=api_key)
     
     headlines_text = "\n".join([f"- {a['title']}" for a in all_articles])
@@ -56,26 +56,36 @@ def fetch_news():
     
     print("Asking Gemini to rank the news...")
     
-    try:
-        # Use the new SDK method and a supported model (gemini-2.0-flash)
-        response = client.models.generate_content(
-            model='gemini-3.8-flash',
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
+    # 3. Retry Logic for 503 Errors
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            response = client.models.generate_content(
+                model='gemini-3.8-flash',
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                )
             )
-        )
-        
-        rankings = json.loads(response.text)
-        rankings.sort(key=lambda x: x['score'], reverse=True)
-        
-        print("\n--- 🏆 TODAY'S TOP STORY ---")
-        print(f"Headline: {rankings[0]['title']}")
-        print(f"Importance Score: {rankings[0]['score']}/10")
-        print("\n(Stage 3 will generate the image for this headline next!)")
-        
-    except Exception as e:
-        print(f"❌ Gemini Error: {e}")
+            
+            # If successful, parse and print
+            rankings = json.loads(response.text)
+            rankings.sort(key=lambda x: x['score'], reverse=True)
+            
+            print("\n--- 🏆 TODAY'S TOP STORY ---")
+            print(f"Headline: {rankings[0]['title']}")
+            print(f"Importance Score: {rankings[0]['score']}/10")
+            print("\n(Stage 3 will generate the image for this headline next!)")
+            
+            break # Exit the loop since it worked!
+            
+        except Exception as e:
+            if "503" in str(e) and attempt < max_retries - 1:
+                print(f"⚠️ Google is busy (503). Retrying in 5 seconds... (Attempt {attempt + 1}/{max_retries})")
+                time.sleep(5)
+            else:
+                print(f"❌ Gemini Error: {e}")
+                break
 
 if __name__ == "__main__":
     fetch_news()
